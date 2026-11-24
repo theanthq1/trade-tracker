@@ -1,0 +1,22 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      SCHWAB_MOCK_DATA: "1"
+      MPLCONFIGDIR: /tmp/trade-tracker-mpl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e .
+      - run: python -m py_compile *.py app/**/*.py
+      - run: python -m unittest discover -v

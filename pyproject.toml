@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trade-tracker"
+version = "0.1.0"
+description = "Local Qt trade journal and trade-analysis tool"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = [
+    "PySide6>=6.5",
+    "platformdirs>=4.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+trade-tracker = "app.main:main"
+
+[tool.setuptools]
+py-modules = [
+    "trade_tracker", "config", "database",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]

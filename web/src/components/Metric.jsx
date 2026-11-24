@@ -1,0 +1,1 @@
+export default function Metric({ label, value, detail, tone = '' }) { return <div className="metric"><span className="eyebrow">{label}</span><strong className={tone}>{value}</strong>{detail && <small>{detail}</small>}</div> }
