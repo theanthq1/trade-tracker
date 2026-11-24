@@ -3,7 +3,7 @@ export const n = (value) => Number.isFinite(Number(value)) ? Number(value) : nul
 export function enrichTrade(row) {
   const entry = n(row.option_entry)
   const exit = n(row.option_exit)
-  const pnl = entry !== null && exit !== null ? (exit - entry) * 100 : null
+  const pnl = entry !== null && exit !== null ? (exit - entry) : null
   const returnPct = entry ? ((exit - entry) / entry) * 100 : null
   const start = row.option_entry_typed_at || row.created_at
   const end = row.option_exit_typed_at || row.exit_timer_started_at

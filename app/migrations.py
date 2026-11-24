@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from database import ensure_trade_schema
 
 
-LATEST_VERSION = 4
+LATEST_VERSION = 5
 
 
 def _migration_001_initial_schema(connection: sqlite3.Connection) -> None:
@@ -29,11 +29,60 @@ def _migration_004_add_session_reference_prices(connection: sqlite3.Connection) 
     ensure_trade_schema(connection)
 
 
+def _migration_005_market_data_snapshots(connection: sqlite3.Connection) -> None:
+    """Add immutable, provider-neutral market-data snapshots."""
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS market_data_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            data_type TEXT NOT NULL,
+            resolution TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            raw_response TEXT,
+            error_message TEXT,
+            coverage_note TEXT,
+            is_active INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (trade_id) REFERENCES trades(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS market_data_candles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            candle_time TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL,
+            FOREIGN KEY (snapshot_id) REFERENCES market_data_snapshots(id) ON DELETE CASCADE,
+            UNIQUE(snapshot_id, candle_time)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_market_data_snapshot_lookup
+        ON market_data_snapshots(
+            trade_id, symbol, trade_date, provider, data_type,
+            resolution, start_time, end_time, status, is_active
+        );
+        CREATE INDEX IF NOT EXISTS idx_market_data_candles_snapshot
+        ON market_data_candles(snapshot_id, candle_time);
+        """
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_initial_schema,
     2: _migration_002_add_market_levels,
     3: _migration_003_legacy,
     4: _migration_004_add_session_reference_prices,
+    5: _migration_005_market_data_snapshots,
 }
 
 

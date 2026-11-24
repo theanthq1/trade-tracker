@@ -11,14 +11,16 @@ from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QObject, QSettings, Q
 from PySide6.QtGui import QColor, QDoubleValidator, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QGridLayout, QHeaderView,
-    QLineEdit, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
+    QLineEdit, QFrame, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
     QScrollArea, QSizePolicy, QTableWidget, QTableWidgetItem, QStackedWidget, QFileDialog,
-    QVBoxLayout, QWidget
+    QToolButton, QVBoxLayout, QWidget
 )
 
 from app.ui.analyze_tab import AnalyzeTableColumns as AnalyzeColumns
-from app.ui.tradingview_panel import TradingViewPanel
-from app.market_data.yahoo_finance import YahooFinanceClient, YahooFinanceError
+from app.ui.data_config_dialog import DataConfigDialog
+from app.ui.massive_chart import MassiveChartPanel
+from app.market_data.providers import get_active_market_data_provider, provider_settings
+from app.database.market_data_repository import MarketDataRepository, MarketDataRequest
 from app.database.connection import configure, connect
 from app.database.backup import create_backup, export_database_copy, restore_backup
 from app.migrations import run_migrations
@@ -26,7 +28,7 @@ from app.settings import diagnostic_summary, prepare_database_path
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = prepare_database_path()
-LOGGER = logging.getLogger("trade_tracker.tradingview")
+LOGGER = logging.getLogger("trade_tracker")
 
 
 THEME_PALETTES = {
@@ -52,8 +54,21 @@ def theme_stylesheet(mode):
     return f"""
         QWidget {{ background: {palette['window']}; color: {palette['text']}; font-family: "Tahoma", "Arial", sans-serif; font-size: 13px; }}
         #root, #menuPage {{ background: {palette['window']}; }}
-        #menuTitle {{ color: {palette['text']}; font-size: 24px; font-weight: bold; }}
+        #menuTitle {{ color: {palette['text']}; font-size: 28px; font-weight: bold; }}
         #menuSubtitle {{ color: {palette['muted']}; font-size: 12px; }}
+        #dashboardHeader, #dashboardCard {{ background: {palette['panel']}; border: 1px solid {palette['border']}; border-radius: 10px; }}
+        #sectionTitle {{ background: transparent; color: {palette['text']}; font-size: 15px; font-weight: bold; }}
+        #sectionHint {{ background: transparent; color: {palette['muted']}; font-size: 11px; }}
+        #statusText {{ background: transparent; color: {palette['muted']}; font-size: 12px; }}
+        #dashboardFooter {{ background: transparent; color: {palette['muted']}; font-size: 11px; }}
+        #developerToggle {{ background: transparent; color: {palette['muted']}; border: none; padding: 4px 0; font-weight: bold; text-align: left; }}
+        #developerToggle:hover {{ color: {palette['text']}; }}
+        #primaryAction {{ background: {palette['accent']}; color: #ffffff; border-color: {palette['accent']}; font-size: 14px; font-weight: bold; min-height: 52px; border-radius: 7px; }}
+        #primaryAction:hover {{ background: {palette['accent_hover']}; border-color: {palette['accent_hover']}; }}
+        #primaryAction:pressed {{ background: {palette['accent_pressed']}; }}
+        #secondaryAction {{ min-height: 42px; border-radius: 7px; }}
+        #dataIndicator {{ background: {palette['input']}; border-color: {palette['border']}; border-radius: 7px; min-height: 34px; padding: 0 14px; }}
+        #dataIndicator:hover {{ border-color: {palette['accent']}; }}
         #title {{ color: {palette['text']}; font-size: 20px; font-weight: bold; }}
         #topBar {{ background: {palette['panel']}; border: 1px solid {palette['border']}; border-radius: 5px; padding: 4px; }}
         #card {{ background: {palette['panel']}; color: {palette['text']}; border: 1px solid {palette['border']}; border-radius: 5px; }}
@@ -160,27 +175,63 @@ class WatchlistStatsWorker(QObject):
 
     def __init__(self):
         super().__init__()
-        self.client = YahooFinanceClient(timeout=20)
-
     @Slot()
     def load(self):
-        rows = []
-        errors = []
-        for ticker in self.TICKERS:
-            try:
-                rows.append(self.client.get_atr14(ticker))
-            except YahooFinanceError as error:
-                errors.append(f"{ticker}: {error}")
+        provider = get_active_market_data_provider()
+        try:
+            rows, errors = provider.get_watchlist_statistics(self.TICKERS)
+        except Exception as error:
+            rows = []
+            errors = [str(error)]
         if not rows:
             self.failed.emit("Unable to load watchlist statistics.\n" + "\n".join(errors))
             return
         self.loaded.emit([rows, errors])
 
 
+class ChartDataWorker(QObject):
+    loaded = Signal(object, object)
+    failed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.repository = MarketDataRepository(DB_PATH)
+
+    @Slot(object, bool)
+    def load(self, trade: dict, force_refresh: bool = False):
+        try:
+            entry_timestamp = trade.get("option_entry_typed_at") or trade.get("created_at")
+            if not entry_timestamp:
+                raise ValueError("The selected trade has no entry timestamp.")
+            entry = datetime.fromisoformat(str(entry_timestamp))
+            if entry.tzinfo is None:
+                entry = entry.replace(tzinfo=ZoneInfo("America/New_York"))
+            eastern = ZoneInfo("America/New_York")
+            trade_day = entry.astimezone(eastern).date()
+            trade_date = trade_day.isoformat()
+            start = datetime.combine(trade_day, datetime.min.time(), tzinfo=eastern).replace(hour=4)
+            end = start.replace(hour=10, minute=31)
+            provider = get_active_market_data_provider()
+            request = MarketDataRequest(
+                trade_id=int(trade["id"]), symbol=str(trade["ticker_symbol"]).strip().upper(),
+                trade_date=trade_date, provider=provider.name, data_type="candles",
+                resolution="1m", start_time=start, end_time=end,
+            )
+            result = self.repository.load_or_fetch(
+                request,
+                lambda: provider.get_historical_bars(request.symbol, start, end, request.resolution),
+                force_refresh=force_refresh,
+            )
+            self.loaded.emit(trade, result)
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            self.failed.emit(str(error))
+
+
 class TradeTracker(QMainWindow):
     trade_load_requested = Signal()
     image_encode_requested = Signal(object)
     watchlist_stats_requested = Signal()
+    chart_requested = Signal(object, bool)
 
     def __init__(self):
         super().__init__()
@@ -194,6 +245,7 @@ class TradeTracker(QMainWindow):
         if self.theme_mode not in THEME_PALETTES:
             self.theme_mode = "dark"
         self.theme_buttons = []
+        self.provider_settings = provider_settings()
         self.db = configure(connect(DB_PATH))
         self.db_lock = threading.Lock()
 
@@ -232,10 +284,22 @@ class TradeTracker(QMainWindow):
         self.watchlist_worker.failed.connect(self.show_worker_error)
         self.watchlist_thread.start()
 
+        self.chart_thread = QThread(self)
+        self.chart_worker = ChartDataWorker()
+        self.chart_worker.moveToThread(self.chart_thread)
+        self.chart_requested.connect(self.chart_worker.load)
+        self.chart_worker.loaded.connect(self.apply_chart_data)
+        self.chart_worker.failed.connect(self.show_chart_error)
+        self.chart_thread.start()
+        self.chart_result = None
+        self.current_chart_trade = None
+
     def build_ui(self):
         root = QWidget()
         root.setObjectName("root")
         self.setCentralWidget(root)
+        self.resize(980, 680)
+        self.setMinimumSize(760, 560)
         outer = QVBoxLayout(root)
         outer.setContentsMargins(0, 0, 0, 0)
         self.pages = QStackedWidget()
@@ -244,50 +308,114 @@ class TradeTracker(QMainWindow):
         self.menu_page = QWidget()
         self.menu_page.setObjectName("menuPage")
         menu_layout = QVBoxLayout(self.menu_page)
-        menu_layout.setContentsMargins(28, 24, 28, 24)
-        menu_layout.setSpacing(8)
-        menu_layout.addStretch(1)
-        menu_title = QLabel("Trade tracker")
+        menu_layout.setContentsMargins(36, 28, 36, 24)
+        menu_layout.setSpacing(16)
+
+        header = QFrame()
+        header.setObjectName("dashboardHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(24, 18, 20, 18)
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(3)
+        menu_title = QLabel("Trade Tracker")
         menu_title.setObjectName("menuTitle")
-        menu_title.setAlignment(Qt.AlignCenter)
-        menu_layout.addWidget(menu_title)
-        menu_subtitle = QLabel(f"Personal options journal\n{diagnostic_summary()}")
+        title_stack.addWidget(menu_title)
+        menu_subtitle = QLabel("Personal Options Journal")
         menu_subtitle.setObjectName("menuSubtitle")
-        menu_subtitle.setAlignment(Qt.AlignCenter)
-        menu_layout.addWidget(menu_subtitle)
-        menu_layout.addSpacing(14)
+        title_stack.addWidget(menu_subtitle)
+        header_layout.addLayout(title_stack)
+        header_layout.addStretch(1)
         add_entry = QPushButton("New Trade")
-        add_entry.setObjectName("menuButton")
+        add_entry.setObjectName("primaryAction")
         add_entry.clicked.connect(self.show_add_entry)
-        analyze = QPushButton("Analyze")
-        analyze.setObjectName("menuButton")
+        self.data_indicator = QPushButton()
+        self.data_indicator.setObjectName("dataIndicator")
+        self.data_indicator.clicked.connect(self.open_data_config)
+        self.update_data_indicator(self.provider_settings.value("market_data/provider", "Massive", type=str), "gray")
+        header_layout.addWidget(self.data_indicator)
+        menu_layout.addWidget(header)
+
+        content = QGridLayout()
+        content.setHorizontalSpacing(16)
+        content.setVerticalSpacing(16)
+        trading_card, trading_layout = self.dashboard_card("Trading", "Start or record your trading workflow.")
+        add_entry.setObjectName("primaryAction")
+        trading_layout.addWidget(add_entry)
+        trading_layout.addWidget(self.dashboard_hint("Create a new options trade journal entry."))
+        content.addWidget(trading_card, 0, 0)
+
+        analysis_card, analysis_layout = self.dashboard_card("Analysis", "Review performance and market context.")
+        analyze = QPushButton("Analyze Trades")
+        analyze.setObjectName("primaryAction")
         analyze.clicked.connect(self.show_analysis)
         watchlist = QPushButton("Watchlist Stats")
-        watchlist.setObjectName("menuButton")
+        watchlist.setObjectName("secondaryAction")
         watchlist.clicked.connect(self.show_watchlist_stats)
+        analysis_layout.addWidget(analyze)
+        analysis_layout.addWidget(watchlist)
+        content.addWidget(analysis_card, 0, 1)
+        content.setColumnStretch(0, 1)
+        content.setColumnStretch(1, 1)
+        menu_layout.addLayout(content)
+
+        data_card, data_layout = self.dashboard_card("Data & Connections", "The selected provider powers charts, ATR, and market analysis.")
+        data_form = QFormLayout()
+        self.home_provider_combo = QComboBox()
+        self.home_provider_combo.addItems(["Schwab", "Massive", "IBKR PRO"])
+        self.home_provider_combo.setCurrentText(self.provider_settings.value("market_data/provider", "Massive", type=str))
+        self.home_provider_combo.currentTextChanged.connect(self.select_home_provider)
+        data_form.addRow("Data Provider", self.home_provider_combo)
+        self.home_data_status = QLabel("Not tested")
+        self.home_data_status.setObjectName("statusText")
+        self.update_data_indicator(self.provider_settings.value("market_data/provider", "Massive", type=str), "gray")
+        data_form.addRow("Status", self.home_data_status)
+        data_layout.addLayout(data_form)
+        data_actions = QHBoxLayout()
+        configure_data = QPushButton("Configure Provider")
+        configure_data.setObjectName("secondaryAction")
+        configure_data.clicked.connect(self.open_data_config)
+        test_data = QPushButton("Test Connection")
+        test_data.setObjectName("secondaryAction")
+        test_data.clicked.connect(self.test_data_connection)
+        data_actions.addWidget(configure_data)
+        data_actions.addWidget(test_data)
+        data_layout.addLayout(data_actions)
+        menu_layout.addWidget(data_card)
+
+        developer_toggle = QToolButton()
+        developer_toggle.setObjectName("developerToggle")
+        developer_toggle.setText("Developer Tools")
+        developer_toggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        developer_toggle.setArrowType(Qt.RightArrow)
+        developer_toggle.setCheckable(True)
+        developer_toggle.setChecked(False)
+        menu_layout.addWidget(developer_toggle)
+        developer_panel = QFrame()
+        developer_panel.setObjectName("dashboardCard")
+        developer_layout = QHBoxLayout(developer_panel)
+        developer_layout.setContentsMargins(18, 14, 18, 14)
         backup = QPushButton("Backup Database")
-        backup.setObjectName("menuButton")
+        backup.setObjectName("secondaryAction")
         backup.clicked.connect(self.create_database_backup)
         restore = QPushButton("Restore Database")
-        restore.setObjectName("menuButton")
+        restore.setObjectName("dangerButton")
         restore.clicked.connect(self.restore_database_backup)
-        back_to_menu = QPushButton("Back to menu")
-        back_to_menu.setObjectName("backButton")
-        back_to_menu.clicked.connect(self.show_menu)
-        for button in (add_entry, analyze, watchlist, backup, restore):
-            button.setMinimumHeight(38)
-            button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-            menu_layout.addWidget(button, 0, Qt.AlignHCenter)
-        menu_actions = QHBoxLayout()
-        menu_actions.setSpacing(8)
-        back_to_menu.setMinimumHeight(38)
-        back_to_menu.setFixedWidth(112)
-        back_to_menu.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        menu_actions.addWidget(back_to_menu)
-        menu_actions.addWidget(self.create_theme_button())
-        menu_actions.setAlignment(Qt.AlignHCenter)
-        menu_layout.addLayout(menu_actions)
-        menu_layout.addStretch(1)
+        diagnostics = QPushButton("Database Diagnostics")
+        diagnostics.setObjectName("secondaryAction")
+        diagnostics.clicked.connect(self.show_database_diagnostics)
+        for button in (backup, restore, diagnostics):
+            developer_layout.addWidget(button)
+        developer_panel.setVisible(False)
+        developer_toggle.toggled.connect(lambda expanded: (developer_panel.setVisible(expanded), developer_toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)))
+        menu_layout.addWidget(developer_panel)
+
+        footer = QHBoxLayout()
+        footer_label = QLabel("Local-first trade journal")
+        footer_label.setObjectName("dashboardFooter")
+        footer.addWidget(footer_label)
+        footer.addStretch(1)
+        footer.addWidget(self.create_theme_button())
+        menu_layout.addLayout(footer)
         self.pages.addWidget(self.menu_page)
 
         self.build_entry_page()
@@ -487,10 +615,12 @@ class TradeTracker(QMainWindow):
         self.table.setAlternatingRowColors(True)
         table_layout.addWidget(self.table)
         page_layout.addWidget(table_card, 1)
-        self.tradingview_panel = TradingViewPanel(DB_PATH)
-        self.tradingview_panel.setObjectName("card")
-        self.tradingview_panel.setVisible(False)
-        page_layout.addWidget(self.tradingview_panel, 1)
+        self.massive_chart_panel = MassiveChartPanel()
+        self.massive_chart_panel.setObjectName("card")
+        self.massive_chart_panel.setVisible(False)
+        self.massive_chart_panel.refresh_requested.connect(self.refresh_current_chart)
+        self.massive_chart_panel.details_requested.connect(self.show_chart_details)
+        page_layout.addWidget(self.massive_chart_panel, 1)
         self.pages.addWidget(self.analysis_page)
 
     def build_watchlist_page(self):
@@ -507,11 +637,11 @@ class TradeTracker(QMainWindow):
         title = QLabel("Daily volatility snapshot")
         title.setObjectName("tableTitle")
         intro_layout.addWidget(title)
-        description = QLabel("Wilder Average True Range (ATR 14) for your core watchlist. Values use daily OHLC data and refresh from Yahoo Finance.")
+        description = QLabel("One Massive batch request for the current session range of your core watchlist. This view is intentionally not labeled ATR(14): accurate ATR(14) requires historical bars for each symbol.")
         description.setObjectName("menuSubtitle")
         description.setWordWrap(True)
         intro_layout.addWidget(description)
-        formula = QLabel("ATRₜ = (ATRₜ₋₁ × 13 + TRₜ) ÷ 14    ·    TR = max(H − L, |H − previous close|, |L − previous close|)")
+        formula = QLabel("Daily range = session high − session low    ·    Range % = daily range ÷ last close")
         formula.setObjectName("eyebrow")
         formula.setWordWrap(True)
         intro_layout.addWidget(formula)
@@ -519,8 +649,8 @@ class TradeTracker(QMainWindow):
 
         stats = QHBoxLayout()
         stats.setSpacing(14)
-        self.watchlist_avg_atr = self.stat_card("AVERAGE ATR", "—")
-        self.watchlist_avg_percent = self.stat_card("AVERAGE ATR %", "—")
+        self.watchlist_avg_atr = self.stat_card("AVERAGE DAILY RANGE", "—")
+        self.watchlist_avg_percent = self.stat_card("AVERAGE RANGE %", "—")
         self.watchlist_updated = self.stat_card("SYMBOLS LOADED", "—")
         for card in (self.watchlist_avg_atr[0], self.watchlist_avg_percent[0], self.watchlist_updated[0]):
             stats.addWidget(card)
@@ -546,7 +676,7 @@ class TradeTracker(QMainWindow):
         heading.addWidget(refresh)
         table_layout.addLayout(heading)
         self.watchlist_table = QTableWidget(0, 5)
-        self.watchlist_table.setHorizontalHeaderLabels(["Ticker", "ATR (14)", "ATR %", "Last close", "Status"])
+        self.watchlist_table.setHorizontalHeaderLabels(["Ticker", "Daily range", "Range %", "Last close", "Status"])
         self.watchlist_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.watchlist_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.watchlist_table.verticalHeader().setVisible(False)
@@ -623,11 +753,78 @@ class TradeTracker(QMainWindow):
         self.watchlist_status.setText("Loading market data…")
         self.watchlist_stats_requested.emit()
 
+    @staticmethod
+    def dashboard_hint(text):
+        hint = QLabel(text)
+        hint.setObjectName("sectionHint")
+        hint.setWordWrap(True)
+        return hint
+
+    @staticmethod
+    def dashboard_card(title, hint):
+        card = QFrame()
+        card.setObjectName("dashboardCard")
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 18, 20, 20)
+        layout.setSpacing(10)
+        title_label = QLabel(title)
+        title_label.setObjectName("sectionTitle")
+        layout.addWidget(title_label)
+        hint_label = TradeTracker.dashboard_hint(hint)
+        layout.addWidget(hint_label)
+        return card, layout
+
+    def select_home_provider(self, provider):
+        self.provider_settings.setValue("market_data/provider", provider)
+        self.update_data_indicator(provider, "gray")
+        self.open_data_config()
+
+    def test_data_connection(self):
+        provider_name = self.provider_settings.value("market_data/provider", "Massive", type=str)
+        self.update_data_indicator(provider_name, "yellow")
+        self.home_data_status.setText("Testing connection…")
+        try:
+            ok, message = get_active_market_data_provider().test_connection()
+        except Exception as error:
+            ok, message = False, str(error)
+        self.update_data_indicator(provider_name, "green" if ok else "red")
+        self.home_data_status.setText(message)
+
+    def show_database_diagnostics(self):
+        QMessageBox.information(
+            self,
+            "Database Diagnostics",
+            f"{diagnostic_summary()}\n\n"
+            f"Active provider: {self.provider_settings.value('market_data/provider', 'Massive', type=str)}",
+        )
+
+    def open_data_config(self):
+        dialog = DataConfigDialog(self)
+        dialog.provider_changed.connect(self.update_data_indicator)
+        dialog.exec()
+        active = self.provider_settings.value("market_data/provider", "Massive", type=str)
+        self.home_provider_combo.blockSignals(True)
+        self.home_provider_combo.setCurrentText(active)
+        self.home_provider_combo.blockSignals(False)
+        self.test_data_connection()
+
+    @Slot(str, str)
+    def update_data_indicator(self, provider, status):
+        if not hasattr(self, "data_indicator"):
+            return
+        colors = {"green": "#22c55e", "red": "#ef4444", "yellow": "#eab308", "gray": "#9da3ad"}
+        self.data_indicator.setText(f"Data ● {provider}")
+        self.data_indicator.setStyleSheet(f"color: {colors.get(status, colors['gray'])};")
+        if hasattr(self, "home_data_status"):
+            status_text = {"green": "● Connected", "red": "● Not connected", "yellow": "● Testing", "gray": "● Not configured"}
+            self.home_data_status.setText(status_text.get(status, "● Not configured"))
+
     def _get_trade_for_chart(self, trade_id):
         row = self.db.execute(
             """
             SELECT id, ticker_symbol, created_at, option_entry_typed_at,
-                   option_exit_typed_at, stock_entry, stock_exit
+                   option_exit_typed_at, stock_entry, stock_exit, screenshot
             FROM trades WHERE id = ?
             """,
             (trade_id,),
@@ -638,28 +835,85 @@ class TradeTracker(QMainWindow):
             "id": row[0], "ticker_symbol": row[1], "created_at": row[2],
             "option_entry_typed_at": row[3], "option_exit_typed_at": row[4],
             "stock_entry": row[5], "stock_exit": row[6],
+            "screenshot": row[7],
         }
 
     def load_chart_for_trade(self, trade_id):
         self.show_analysis()
         try:
             trade = self._get_trade_for_chart(trade_id)
-            entry_timestamp = trade["option_entry_typed_at"]
-            parsed_entry = datetime.fromisoformat(entry_timestamp) if entry_timestamp else None
-            if parsed_entry is not None and parsed_entry.tzinfo is not None:
-                trade_date = parsed_entry.astimezone(ZoneInfo("America/New_York")).date().isoformat()
-            else:
-                trade_date = "missing"
-            LOGGER.info(
-                "Chart request trade_id=%s ticker=%s trade_date=%s entry_timestamp=%s exit_timestamp=%s entry_price=%s exit_price=%s",
-                trade["id"], trade["ticker_symbol"], trade_date,
-                trade["option_entry_typed_at"], trade["option_exit_typed_at"],
-                trade["stock_entry"], trade["stock_exit"],
-            )
-            self.tradingview_panel.setVisible(True)
-            self.tradingview_panel.load_trade(trade)
+            self.current_chart_trade = trade
+            self.massive_chart_panel.setVisible(True)
+            self.massive_chart_panel.show_loading(trade)
+            self.chart_requested.emit(trade, False)
         except Exception as error:
-            QMessageBox.warning(self, "Chart Unavailable", str(error))
+            self.show_chart_error(str(error))
+
+    def view_screenshot_for_trade(self, trade_id):
+        self.show_analysis()
+        try:
+            trade = self._get_trade_for_chart(trade_id)
+            self.massive_chart_panel.setVisible(True)
+            self.massive_chart_panel.show_screenshot(trade)
+        except Exception as error:
+            self.show_chart_error(str(error))
+
+    def refresh_current_chart(self):
+        if not self.current_chart_trade:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Refresh Market Data",
+            "Fetch new market data and save it as a separate snapshot? The existing snapshot will be preserved.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.massive_chart_panel.show_loading(self.current_chart_trade)
+        self.chart_requested.emit(self.current_chart_trade, True)
+
+    def show_chart_details(self):
+        if not self.chart_result:
+            return
+        result = self.chart_result
+        request = result.get("request")
+        details = [
+            f"Data source: {result.get('provider', '—')}",
+            f"Cache status: {result.get('status', '—')}",
+            f"Snapshot ID: {result.get('snapshot_id', '—')}",
+            f"Fetched: {result.get('fetched_at', '—')}",
+            f"Bars: {len(result.get('candles') or [])}",
+        ]
+        if request:
+            details.extend([
+                f"Trade ID: {request.trade_id}",
+                f"Range: {request.start_key} → {request.end_key}",
+                f"Resolution: {request.resolution}",
+            ])
+        if result.get("coverage_note"):
+            details.append(f"Coverage: {result['coverage_note']}")
+        if result.get("error_message"):
+            details.append(f"Error: {result['error_message']}")
+        QMessageBox.information(self, "Market Data Details", "\n".join(details))
+
+    @Slot(object, object)
+    def apply_chart_data(self, trade, result):
+        self.chart_result = result
+        self.massive_chart_panel.setVisible(True)
+        if result.get("candles"):
+            self.massive_chart_panel.show_data(trade, result["candles"], result)
+        else:
+            self.massive_chart_panel.show_error(
+                f"Data source: {result.get('provider', '—')} · "
+                f"Cache status: {result.get('status', 'No data available')}"
+                + (f" · {result['error_message']}" if result.get("error_message") else "")
+            )
+
+    @Slot(str)
+    def show_chart_error(self, message):
+        self.massive_chart_panel.setVisible(True)
+        self.massive_chart_panel.show_error(f"Chart unavailable: {message}")
 
     def create_database_backup(self):
         try:
@@ -928,16 +1182,22 @@ class TradeTracker(QMainWindow):
         for row_index, trade in enumerate(trades):
             trade_id = trade[0]
             for column, value in enumerate(trade[1:-1]):
+                if column == AnalyzeColumns.SCREENSHOT and value == "Attached":
+                    screenshot_button = QPushButton("View Screenshot")
+                    screenshot_button.setMinimumSize(120, 34)
+                    screenshot_button.clicked.connect(
+                        lambda checked=False, trade_id=trade_id: self.view_screenshot_for_trade(trade_id)
+                    )
+                    self.table.setCellWidget(row_index, column, screenshot_button)
+                    continue
                 item = QTableWidgetItem(value)
                 if column in (AnalyzeColumns.OPTION_PNL, AnalyzeColumns.OPTION_PERCENT):
                     item.setForeground(QColor(self.positive_color if trade[-1] else self.negative_color))
                 self.table.setItem(row_index, column, item)
             button = QPushButton("View Chart")
             button.setMinimumSize(120, 34)
-            button.setProperty("trade_id", trade_id)
             button.clicked.connect(lambda checked=False, trade_id=trade_id: self.load_chart_for_trade(trade_id))
             self.table.setCellWidget(row_index, AnalyzeColumns.CHART, button)
-
         self.table.resizeColumnsToContents()
         self.total_stat[1].setText(str(total))
         sign = "+" if total_pnl >= 0 else "-"
@@ -952,10 +1212,10 @@ class TradeTracker(QMainWindow):
             self.watchlist_table.insertRow(row_index)
             values = (
                 stats["ticker"],
-                f"${stats['atr14']:.2f}",
-                f"{stats['atr_percent']:.2f}%",
+                f"${stats['daily_range']:.2f}",
+                f"{stats['range_percent']:.2f}%",
                 f"${stats['last_close']:.2f}",
-                f"{stats['days_used']} daily ranges",
+                f"{stats['days_used']} session snapshot",
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -963,9 +1223,9 @@ class TradeTracker(QMainWindow):
                     item.setForeground(QColor(self.positive_color))
                 self.watchlist_table.setItem(row_index, column, item)
         if rows:
-            average_atr = sum(row["atr14"] for row in rows) / len(rows)
-            average_percent = sum(row["atr_percent"] for row in rows) / len(rows)
-            self.watchlist_avg_atr[1].setText(f"${average_atr:.2f}")
+            average_range = sum(row["daily_range"] for row in rows) / len(rows)
+            average_percent = sum(row["range_percent"] for row in rows) / len(rows)
+            self.watchlist_avg_atr[1].setText(f"${average_range:.2f}")
             self.watchlist_avg_percent[1].setText(f"{average_percent:.2f}%")
             self.watchlist_updated[1].setText(f"{len(rows)} / {len(WatchlistStatsWorker.TICKERS)}")
         self.watchlist_status.setText(
@@ -978,10 +1238,11 @@ class TradeTracker(QMainWindow):
         self.trade_load_thread.quit()
         self.image_encode_thread.quit()
         self.watchlist_thread.quit()
-        self.tradingview_panel.close()
+        self.chart_thread.quit()
         self.trade_load_thread.wait()
         self.image_encode_thread.wait()
         self.watchlist_thread.wait()
+        self.chart_thread.wait()
         self.db.close()
         event.accept()
 

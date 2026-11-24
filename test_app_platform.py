@@ -1,9 +1,7 @@
-import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from app.database.backup import create_backup, restore_backup
 from app.database.connection import connect
@@ -16,19 +14,17 @@ class AppPlatformTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trades.db"
             with connect(path) as connection:
-                self.assertEqual(run_migrations(connection), 4)
+                self.assertEqual(run_migrations(connection), 5)
                 tables = {
                     row[0] for row in connection.execute(
                         "SELECT name FROM sqlite_master WHERE type='table'"
                     )
                 }
             self.assertTrue(path.exists())
-            self.assertTrue({"schema_version", "trades"}.issubset(tables))
+            self.assertTrue({"schema_version", "trades", "market_data_snapshots", "market_data_candles"}.issubset(tables))
 
-    def test_database_path_uses_configured_data_directory(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with patch.dict(os.environ, {"TRADE_TRACKER_DATA_DIR": directory}):
-                self.assertEqual(database_path(), Path(directory) / "trades.db")
+    def test_database_path_is_in_application_directory(self):
+        self.assertEqual(database_path(), Path(__file__).resolve().parent / "trades.db")
 
     def test_sqlite_backup_and_confirmed_restore(self):
         with tempfile.TemporaryDirectory() as directory:

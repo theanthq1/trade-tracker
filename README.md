@@ -21,24 +21,34 @@ python trade_tracker.py
 
 ## Data
 
-Application data is stored outside the source checkout:
-
-- Linux: `~/.local/share/trade-tracker/trades.db`
-- Windows: `%APPDATA%\\TradeTracker\\trades.db`
-- macOS: `~/Library/Application Support/TradeTracker/trades.db`
-
-Set `TRADE_TRACKER_DATA_DIR` for a deliberate custom data location.
+Application data is stored in the application directory at `trades.db`.
+Backups are stored in the adjacent `backups/` directory.
 
 ## Analyze tab
 
 Analyze displays the saved trade history, total trades, option P/L, win rate,
-screenshots, timestamps, and trade details. The embedded TradingView chart uses
-the selected stock ticker and replays one-minute bars from the local
-`stock_candles` table from 9:30–10:30 AM America/New_York. The replay starts
-empty and reveals one candle at a time with play/pause, stepping, reset, and
-speed controls. Simulated orders support close/next-open execution,
-slippage, commissions, and P/L metrics. Because the source is OHLC bars, the
-replay cannot know the order of price movement inside a minute.
+screenshots, timestamps, and trade details. Each row has a read-only View Chart
+action that retrieves one-minute historical OHLC data from Massive for the
+underlying ticker, from 4:00 AM through 10:30 AM America/New_York. The chart
+marks the actual recorded stock entry and exit; it does not create simulated
+orders. Massive's free Stocks Basic plan is end-of-day, so a chart for a trade
+recorded today becomes available after midnight Eastern Time; the app avoids
+sending that request and explains the delay instead of returning a plan error.
+
+## Planned market replay
+
+The desktop application uses Massive's direct REST integration because the
+hosted Massive MCP server is an OAuth connection for MCP clients, not an
+in-process API available to the Qt application. The REST client reads
+`MASSIVE_API_KEY` from `.env`; the key is never stored in source code or
+printed in logs. OHLC data cannot reveal the intrabar path, so finer replay
+accuracy would require Massive trade/quote data.
+
+The Data button on the main menu selects Schwab, Massive, or IBKR PRO. The
+selection persists in application settings and controls charts and ATR. A
+provider is never substituted automatically when the selected provider fails.
+Massive keys are stored in the operating-system keyring when available, with a
+local settings fallback.
 
 ## Backups
 

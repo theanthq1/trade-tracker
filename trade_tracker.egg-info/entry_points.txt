@@ -1,0 +1,2 @@
+[console_scripts]
+trade-tracker = app.main:main

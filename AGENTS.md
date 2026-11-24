@@ -21,10 +21,7 @@ The application uses:
 - Python
 - Qt GUI
 - SQLite
-- Massive MCP data
-- TradingView-compatible chart rendering
 - Historical trade analysis
-- Market replay functionality
 
 ---
 
@@ -34,11 +31,7 @@ The application must:
 
 1. Read individual trades from `trades.db`.
 2. Identify the underlying stock ticker and trade date.
-3. Retrieve historical stock market data for the first hour of the trading day.
-4. Display candlestick charts from premarket to the end of the first hour.
-5. Mark actual stock entry and exit executions.
-6. Support historical price-action replay.
-7. Calculate trade statistics such as:
+3. Calculate trade statistics such as:
    - Percentage return
    - Win/loss result
    - Mean return
@@ -73,44 +66,8 @@ Relevant fields may include:
 - `option_exit_typed_at`
 - `length_of_trade_seconds`
 
-### `stock_candles`
-
-Relevant fields may include:
-
-- `symbol`
-- `trading_date`
-- `candle_time`
-- `open`
-- `high`
-- `low`
-- `close`
-- `volume`
-
 Do not change the existing schema without first explaining the reason and migration plan.
 
----
-
-## Trade Selection Workflow
-
-The chart must begin from a specific row in the Analyze tab.
-
-When the user clicks a row's Chart button:
-
-1. Retrieve the exact trade ID.
-2. Load the corresponding row from `trades`.
-3. Read the underlying stock ticker.
-4. Read the trade date.
-5. Read stock entry timestamp and price.
-6. Read stock exit timestamp and price.
-7. Load market data for that ticker and date.
-8. Render the chart for that specific trade.
-
-Never use a hard-coded ticker or date.
-
-Use the underlying stock ticker, not the option contract symbol.
-
----
-
-## Market Data
-
-Use the connected Massive MCP 
+Charting is read-only and uses Massive market data for the selected trade.
+Preserve actual recorded executions only; do not reintroduce simulated order
+entry without an explicit request.

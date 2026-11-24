@@ -1,1 +1,1 @@
-"""Local market-data bridge used by the embedded TradingView chart."""
+"""Market-data adapters used by the trade journal."""
